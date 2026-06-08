@@ -33,16 +33,21 @@ C_PROD  = "#4db8e8"
 C_DEVIS = "#1a3a6b"
 
 
-# ── Chargement des données avec contournement du blocage 403 ──────────────────
+# ── Chargement des données avec contournement renforcé ────────────────────────
 @st.cache_data(ttl=3600)
 def load_data(path_or_url_or_bytes):
-    # Si la source est une URL (SharePoint/OneDrive), on feinte Microsoft en se faisant passer pour un navigateur
     if isinstance(path_or_url_or_bytes, str) and path_or_url_or_bytes.startswith(("http://", "https://")):
+        # Entêtes de navigation complets pour imiter parfaitement Chrome
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1"
         }
-        response = requests.get(path_or_url_or_bytes, headers=headers)
-        response.raise_for_status()  # Déclenche une erreur si le lien est mort
+        response = requests.get(path_or_url_or_bytes, headers=headers, allow_redirects=True, timeout=15)
+        response.raise_for_status()
         file_to_read = io.BytesIO(response.content)
     else:
         file_to_read = path_or_url_or_bytes
@@ -75,27 +80,46 @@ def load_data(path_or_url_or_bytes):
 st.markdown('<div class="main-header">📊  Tableau de Bord LBFI – Suivi des Temps de Production</div>',
             unsafe_allow_html=True)
 
-# ── Résolution du fichier (Cloud / Secrets) ───────────────────────────────────
+# ── Gestion intelligente du fichier source (Cloud vs Manuel) ──────────────────
 excel_url = st.secrets.get("EXCEL_DATA_URL", None)
 df_all = None
 src_label = ""
+cloud_error_msg = None
 
 if excel_url:
     try:
         df_all = load_data(excel_url)
         src_label = "Lien Cloud (OneDrive/SharePoint)"
     except Exception as e:
-        st.error(f"❌ Erreur lors de l'accès automatique au fichier Cloud : {e}")
-        st.info("Vérifiez la validité de votre lien dans les Secrets ou passez par l'import manuel ci-dessous.")
+        df_all = None
+        cloud_error_msg = str(e)
 
+# Si le cloud a échoué ou n'est pas configuré, on affiche l'alternative proprement
 if df_all is None:
-    st.warning("⚠️ Fichier source cloud non configuré ou inaccessible. Déposez le fichier Excel ci-dessous.")
-    uploaded = st.file_uploader("Fichier **Suivi Activité LBFI DATA SOURCE.xlsm / .xlsx**", type=["xlsx","xlsm"])
+    if excel_url:
+        st.error("🔒 **Accès SharePoint restreint par la sécurité de votre entreprise**")
+        st.markdown(f"""
+        <small style="color:gray;">Détail technique : {cloud_error_msg}</small>
+        
+        La sécurité de votre organisation bloque les requêtes automatiques provenant de serveurs cloud externes. 
+        
+        **Pour continuer, déposez simplement votre fichier Excel ci-dessous :**
+        """, unsafe_allow_html=True)
+    else:
+        st.warning("⚠️ **Fichier source cloud non configuré.**")
+    
+    uploaded = st.file_uploader("Glissez-déposez le fichier **Suivi Activité LBFI DATA SOURCE.xlsm**", type=["xlsx","xlsm"])
     if uploaded is None:
-        st.info("Pour automatiser cette étape, configurez la variable `EXCEL_DATA_URL` dans les secrets Streamlit.")
+        if not excel_url:
+            st.info("💡 Pour automatiser la synchronisation, ajoutez la variable `EXCEL_DATA_URL` dans les Secrets de Streamlit.")
         st.stop()
-    df_all = load_data(uploaded)
-    src_label = "Fichier téléversé manuellement"
+    
+    try:
+        df_all = load_data(uploaded)
+        src_label = "Fichier téléversé manuellement"
+    except Exception as e:
+        st.error(f"❌ Impossible de lire le fichier téléversé : {e}")
+        st.stop()
 
 # ── Plage des données + défaut YTD ───────────────────────────────────────────
 today     = pd.Timestamp.today().normalize()
