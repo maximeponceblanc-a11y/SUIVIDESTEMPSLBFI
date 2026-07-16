@@ -33,7 +33,7 @@ C_PROD  = "#4db8e8"
 C_DEVIS = "#1a3a6b"
 
 
-# ── Chargement des données avec contournement du blocage 403 ──────────────────
+# ── Chargement de TOUTES les données (Option 2) ──────────────────────────────
 @st.cache_data(ttl=3600)
 def load_data(path_or_url_or_bytes):
     # Si la source est une URL (SharePoint/OneDrive), on feinte Microsoft en se faisant passer pour un navigateur
@@ -47,29 +47,45 @@ def load_data(path_or_url_or_bytes):
     else:
         file_to_read = path_or_url_or_bytes
 
-    df = pd.read_excel(file_to_read, sheet_name="ordres_fabrication", engine="openpyxl")
-    df["tps_op_h"]    = df["Temps opérateur (h)"] / 3_600_000
-    df["tps_devis_h"] = df["Temps devis (nombre)"] / 3_600_000
-    df["date_cloture"] = pd.to_datetime(df["date_cloture"], errors="coerce")
-    df["semaine_label"] = (df["date_cloture"].dt.isocalendar().year.astype(str) +
-                           "-S" + df["date_cloture"].dt.isocalendar().week.astype(str).str.zfill(2))
-    df["mois_label"]  = df["date_cloture"].dt.to_period("M").astype(str)
-    df["annee_label"] = df["date_cloture"].dt.year.astype(str)
+    # sheet_name=None charge toutes les feuilles du fichier Excel sous forme de dictionnaire {nom_feuille: DataFrame}
+    all_sheets = pd.read_excel(file_to_read, sheet_name=None, engine="openpyxl")
     
-    def clean_id(val):
-        if pd.isna(val): return ""
-        val_str = str(val).strip()
-        if val_str.lower() in ["nan", "nat", "none", ""]: return ""
-        if val_str.endswith(".0"): return val_str[:-2]
-        return val_str
+    # ── Traitement et nettoyage de "ordres_fabrication" ──
+    if "ordres_fabrication" in all_sheets:
+        df = all_sheets["ordres_fabrication"]
+        
+        df["tps_op_h"]    = df["Temps opérateur (h)"] / 3_600_000
+        df["tps_devis_h"] = df["Temps devis (nombre)"] / 3_600_000
+        df["date_cloture"] = pd.to_datetime(df["date_cloture"], errors="coerce")
+        df["semaine_label"] = (df["date_cloture"].dt.isocalendar().year.astype(str) +
+                               "-S" + df["date_cloture"].dt.isocalendar().week.astype(str).str.zfill(2))
+        df["mois_label"]  = df["date_cloture"].dt.to_period("M").astype(str)
+        df["annee_label"] = df["date_cloture"].dt.year.astype(str)
+        
+        def clean_id(val):
+            if pd.isna(val): return ""
+            val_str = str(val).strip()
+            if val_str.lower() in ["nan", "nat", "none", ""]: return ""
+            if val_str.endswith(".0"): return val_str[:-2]
+            return val_str
 
-    df["numero_dossier"] = df["numero_dossier"].apply(clean_id)
-    df["numero_devis"]   = df["numero_devis"].apply(clean_id)
-    df["client"]         = df["client"].fillna("Inconnu").astype(str).str.strip()
-    df["reference"]      = df["reference"].fillna("Inconnu").astype(str).str.strip()
-    
-    df = df[df["date_cloture"].notna()].copy()
-    return df
+        df["numero_dossier"] = df["numero_dossier"].apply(clean_id)
+        df["numero_devis"]   = df["numero_devis"].apply(clean_id)
+        df["client"]         = df["client"].fillna("Inconnu").astype(str).str.strip()
+        df["reference"]      = df["reference"].fillna("Inconnu").astype(str).str.strip()
+        
+        df = df[df["date_cloture"].notna()].copy()
+        
+        # On réinjecte la feuille nettoyée dans notre dictionnaire
+        all_sheets["ordres_fabrication"] = df
+
+    # ── Traitement optionnel de "temps_reel_operateur" ──
+    if "temps_reel_operateur" in all_sheets:
+        df_tr = all_sheets["temps_reel_operateur"]
+        # Vous pouvez insérer ici des règles de nettoyage spécifiques à cette feuille si nécessaire
+        all_sheets["temps_reel_operateur"] = df_tr
+
+    return all_sheets
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-header">📊  Tableau de Bord LBFI – Suivi des Temps de Production</div>',
@@ -77,25 +93,33 @@ st.markdown('<div class="main-header">📊  Tableau de Bord LBFI – Suivi des T
 
 # ── Résolution du fichier (Cloud / Secrets) ───────────────────────────────────
 excel_url = st.secrets.get("EXCEL_DATA_URL", None)
-df_all = None
+sheets_dict = None
 src_label = ""
 
 if excel_url:
     try:
-        df_all = load_data(excel_url)
+        sheets_dict = load_data(excel_url)
         src_label = "Lien Cloud (OneDrive/SharePoint)"
     except Exception as e:
         st.error(f"❌ Erreur lors de l'accès automatique au fichier Cloud : {e}")
         st.info("Vérifiez la validité de votre lien dans les Secrets ou passez par l'import manuel ci-dessous.")
 
-if df_all is None:
+if sheets_dict is None:
     st.warning("⚠️ Fichier source cloud non configuré ou inaccessible. Déposez le fichier Excel ci-dessous.")
     uploaded = st.file_uploader("Fichier **Suivi Activité LBFI DATA SOURCE.xlsm / .xlsx**", type=["xlsx","xlsm"])
     if uploaded is None:
         st.info("Pour automatiser cette étape, configurez la variable `EXCEL_DATA_URL` dans les secrets Streamlit.")
         st.stop()
-    df_all = load_data(uploaded)
+    sheets_dict = load_data(uploaded)
     src_label = "Fichier téléversé manuellement"
+
+# ── Extraction des DataFrames à partir du dictionnaire de feuilles ────────────
+df_all = sheets_dict.get("ordres_fabrication")
+df_temps_reel = sheets_dict.get("temps_reel_operateur")
+
+if df_all is None:
+    st.error("❌ Erreur : La feuille 'ordres_fabrication' est introuvable dans le fichier Excel.")
+    st.stop()
 
 # ── Plage des données + défaut YTD ───────────────────────────────────────────
 today     = pd.Timestamp.today().normalize()
@@ -299,6 +323,17 @@ col_op_chart.plotly_chart(fig_op, use_container_width=True)
 with col_op_tbl:
     st.markdown("**Détail par opération**")
     st.dataframe(by_op_tbl, use_container_width=True, height=390, hide_index=True)
+
+# ── Visualisation de la feuille Temps Réel Opérateur (Nouveauté) ──────────────
+if df_temps_reel is not None:
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander("👁️ Inspecter les données : Feuille 'temps_reel_operateur'"):
+        st.info("Cette section affiche les données brutes chargées à partir de votre deuxième feuille Excel.")
+        st.dataframe(df_temps_reel, use_container_width=True)
+else:
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander("👁️ Inspecter les données : Feuille 'temps_reel_operateur'"):
+        st.warning("La feuille 'temps_reel_operateur' est introuvable ou vide dans ce fichier.")
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("---")
