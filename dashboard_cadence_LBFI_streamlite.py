@@ -32,132 +32,44 @@ st.markdown("""
 C_PROD  = "#4db8e8"
 C_DEVIS = "#1a3a6b"
 
-# Helper pour nettoyer les IDs
-def clean_id(val):
-    if pd.isna(val): return ""
-    val_str = str(val).strip()
-    if val_str.lower() in ["nan", "nat", "none", ""]: return ""
-    if val_str.endswith(".0"): return val_str[:-2]
-    return val_str
 
-# ── Chargement des données avec gestion multi-feuilles ────────────────────────
+# ── Chargement des données avec contournement du blocage 403 ──────────────────
 @st.cache_data(ttl=3600)
-def load_all_data(path_or_url_or_bytes):
-    # Gestion du contournement du blocage Microsoft 403
+def load_data(path_or_url_or_bytes):
+    # Si la source est une URL (SharePoint/OneDrive), on feinte Microsoft en se faisant passer pour un navigateur
     if isinstance(path_or_url_or_bytes, str) and path_or_url_or_bytes.startswith(("http://", "https://")):
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         response = requests.get(path_or_url_or_bytes, headers=headers)
-        response.raise_for_status()
+        response.raise_for_status()  # Déclenche une erreur si le lien est mort
         file_to_read = io.BytesIO(response.content)
     else:
         file_to_read = path_or_url_or_bytes
 
-    # Lecture globale du fichier Excel pour scanner les onglets
-    xls = pd.ExcelFile(file_to_read, engine="openpyxl")
-    sheets = xls.sheet_names
-
-    # 1. Chargement de la feuille "employes" (pour la correspondance id -> Nom)
-    df_emp = pd.DataFrame()
-    sheet_emp = [s for s in sheets if "employ" in s.lower()]
-    if sheet_emp:
-        df_emp = pd.read_excel(xls, sheet_name=sheet_emp[0])
-        # Détection automatique des colonnes ID et Nom
-        id_cols = [c for c in df_emp.columns if any(p in c.lower() for p in ["id", "code", "matr"])]
-        name_cols = [c for c in df_emp.columns if any(p in c.lower() for p in ["nom", "prenom", "agent", "opérateur", "operateur"])]
-        
-        col_map = {}
-        if id_cols: col_map[id_cols[0]] = "id_operateur"
-        if name_cols: col_map[name_cols[0]] = "nom_operateur"
-        df_emp = df_emp.rename(columns=col_map)
-        
-        if "id_operateur" in df_emp.columns:
-            df_emp["id_operateur"] = df_emp["id_operateur"].apply(clean_id)
-            df_emp = df_emp.drop_duplicates(subset=["id_operateur"])
-
-    # 2. Chargement de la feuille "ordres_fabrication"
-    sheet_of = [s for s in sheets if "ordre" in s.lower() or "fabrication" in s.lower()]
-    sheet_of = sheet_of[0] if sheet_of else "ordres_fabrication"
+    df = pd.read_excel(file_to_read, sheet_name="ordres_fabrication", engine="openpyxl")
+    df["tps_op_h"]    = df["Temps opérateur (h)"] / 3_600_000
+    df["tps_devis_h"] = df["Temps devis (nombre)"] / 3_600_000
+    df["date_cloture"] = pd.to_datetime(df["date_cloture"], errors="coerce")
+    df["semaine_label"] = (df["date_cloture"].dt.isocalendar().year.astype(str) +
+                           "-S" + df["date_cloture"].dt.isocalendar().week.astype(str).str.zfill(2))
+    df["mois_label"]  = df["date_cloture"].dt.to_period("M").astype(str)
+    df["annee_label"] = df["date_cloture"].dt.year.astype(str)
     
-    df_of = pd.read_excel(xls, sheet_name=sheet_of)
-    df_of["tps_op_h"]    = df_of["Temps opérateur (h)"] / 3_600_000
-    df_of["tps_devis_h"] = df_of["Temps devis (nombre)"] / 3_600_000
-    df_of["date_cloture"] = pd.to_datetime(df_of["date_cloture"], errors="coerce")
-    df_of["semaine_label"] = (df_of["date_cloture"].dt.isocalendar().year.astype(str) +
-                           "-S" + df_of["date_cloture"].dt.isocalendar().week.astype(str).str.zfill(2))
-    df_of["mois_label"]  = df_of["date_cloture"].dt.to_period("M").astype(str)
-    df_of["annee_label"] = df_of["date_cloture"].dt.year.astype(str)
+    def clean_id(val):
+        if pd.isna(val): return ""
+        val_str = str(val).strip()
+        if val_str.lower() in ["nan", "nat", "none", ""]: return ""
+        if val_str.endswith(".0"): return val_str[:-2]
+        return val_str
 
-    df_of["numero_dossier"] = df_of["numero_dossier"].apply(clean_id)
-    df_of["numero_devis"]   = df_of["numero_devis"].apply(clean_id)
-    df_of["client"]         = df_of["client"].fillna("Inconnu").astype(str).str.strip()
-    df_of["reference"]      = df_of["reference"].fillna("Inconnu").astype(str).str.strip()
-    df_of = df_of[df_of["date_cloture"].notna()].copy()
-
-    # Tentative de liaison de l'opérateur sur la feuille "ordres_fabrication" s'il y a un ID
-    id_op_of_cols = [c for c in df_of.columns if any(p in c.lower() for p in ["id_operateur", "id_opérateur", "id_employe", "code_operateur"])]
-    if id_op_of_cols:
-        df_of = df_of.rename(columns={id_op_of_cols[0]: "id_operateur"})
-        df_of["id_operateur"] = df_of["id_operateur"].apply(clean_id)
-        if not df_emp.empty and "id_operateur" in df_emp.columns:
-            df_of = df_of.merge(df_emp, on="id_operateur", how="left")
-            df_of["nom_operateur"] = df_of["nom_operateur"].fillna(df_of["id_operateur"].apply(lambda x: f"Opérateur {x}" if x else "Inconnu"))
-        else:
-            df_of["nom_operateur"] = df_of["id_operateur"].apply(lambda x: f"Opérateur {x}" if x else "Inconnu")
-    else:
-        df_of["nom_operateur"] = "Inconnu"
-
-    # 3. Chargement de la feuille "temps réel opérateur"
-    df_tr = pd.DataFrame()
-    sheet_tr_candidates = [s for s in sheets if any(p in s.lower() for p in ["reel", "réel", "temps_reel", "temps reel"])]
+    df["numero_dossier"] = df["numero_dossier"].apply(clean_id)
+    df["numero_devis"]   = df["numero_devis"].apply(clean_id)
+    df["client"]         = df["client"].fillna("Inconnu").astype(str).str.strip()
+    df["reference"]      = df["reference"].fillna("Inconnu").astype(str).str.strip()
     
-    if sheet_tr_candidates:
-        df_tr = pd.read_excel(xls, sheet_name=sheet_tr_candidates[0])
-        # Détection des colonnes Date, ID Opérateur, et Heures
-        tr_id_cols = [c for c in df_tr.columns if any(p in c.lower() for p in ["id", "code", "opérateur", "operateur", "employe", "employé"])]
-        tr_date_cols = [c for c in df_tr.columns if any(p in c.lower() for p in ["date", "jour", "debut", "début", "saisie"])]
-        tr_hour_cols = [c for c in df_tr.columns if any(p in c.lower() for p in ["heure", "hour", "temps", "durée", "duree", "tps", "travail"])]
-        
-        col_map_tr = {}
-        if tr_id_cols: col_map_tr[tr_id_cols[0]] = "id_operateur"
-        if tr_date_cols: col_map_tr[tr_date_cols[0]] = "date_travail"
-        if tr_hour_cols: col_map_tr[tr_hour_cols[0]] = "heures_travaillees"
-        
-        df_tr = df_tr.rename(columns=col_map_tr)
-        
-        # Valeurs par défaut si colonnes manquantes
-        if "id_operateur" not in df_tr.columns: df_tr["id_operateur"] = "Inconnu"
-        if "date_travail" not in df_tr.columns: df_tr["date_travail"] = pd.Timestamp.today()
-        if "heures_travaillees" not in df_tr.columns: df_tr["heures_travaillees"] = 0.0
-        
-        # Nettoyage formats
-        df_tr["date_travail"] = pd.to_datetime(df_tr["date_travail"], errors="coerce")
-        df_tr["heures_travaillees"] = pd.to_numeric(df_tr["heures_travaillees"], errors="coerce").fillna(0.0)
-        df_tr["id_operateur"] = df_tr["id_operateur"].apply(clean_id)
-        
-        # Conversion si les heures sont stockées en millisecondes
-        if df_tr["heures_travaillees"].max() > 100_000:
-            df_tr["heures_travaillees"] = df_tr["heures_travaillees"] / 3_600_000
-
-        # Fusion avec les employés pour avoir le nom lisible
-        if not df_emp.empty and "id_operateur" in df_emp.columns:
-            df_tr = df_tr.merge(df_emp, on="id_operateur", how="left")
-            df_tr["nom_operateur"] = df_tr["nom_operateur"].fillna(df_tr["id_operateur"].apply(lambda x: f"Opérateur {x}" if x else "Inconnu"))
-        else:
-            df_tr["nom_operateur"] = df_tr["id_operateur"].apply(lambda x: f"Opérateur {x}" if x else "Inconnu")
-            
-        df_tr = df_tr[df_tr["date_travail"].notna()].copy()
-        
-        # Mailles temporelles pour le Temps Réel
-        df_tr["semaine_label"] = (df_tr["date_travail"].dt.isocalendar().year.astype(str) +
-                               "-S" + df_tr["date_travail"].dt.isocalendar().week.astype(str).str.zfill(2))
-        df_tr["mois_label"]  = df_tr["date_travail"].dt.to_period("M").astype(str)
-        df_tr["annee_label"] = df_tr["date_travail"].dt.year.astype(str)
-        df_tr["jour_label"]  = df_tr["date_travail"].dt.strftime("%Y-%m-%d")
-        df_tr["heure_label"] = df_tr["date_travail"].dt.hour.astype(str).str.zfill(2) + "h"
-
-    return df_of, df_tr, df_emp
+    df = df[df["date_cloture"].notna()].copy()
+    return df
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-header">📊  Tableau de Bord LBFI – Suivi des Temps de Production</div>',
@@ -166,16 +78,15 @@ st.markdown('<div class="main-header">📊  Tableau de Bord LBFI – Suivi des T
 # ── Résolution du fichier (Cloud / Secrets) ───────────────────────────────────
 excel_url = st.secrets.get("EXCEL_DATA_URL", None)
 df_all = None
-df_tr = pd.DataFrame()
-df_emp = pd.DataFrame()
 src_label = ""
 
 if excel_url:
     try:
-        df_all, df_tr, df_emp = load_all_data(excel_url)
+        df_all = load_data(excel_url)
         src_label = "Lien Cloud (OneDrive/SharePoint)"
     except Exception as e:
         st.error(f"❌ Erreur lors de l'accès automatique au fichier Cloud : {e}")
+        st.info("Vérifiez la validité de votre lien dans les Secrets ou passez par l'import manuel ci-dessous.")
 
 if df_all is None:
     st.warning("⚠️ Fichier source cloud non configuré ou inaccessible. Déposez le fichier Excel ci-dessous.")
@@ -183,18 +94,13 @@ if df_all is None:
     if uploaded is None:
         st.info("Pour automatiser cette étape, configurez la variable `EXCEL_DATA_URL` dans les secrets Streamlit.")
         st.stop()
-    df_all, df_tr, df_emp = load_all_data(uploaded)
+    df_all = load_data(uploaded)
     src_label = "Fichier téléversé manuellement"
 
-# ── Plage globale des données étendue aux deux tables ────────────────────────
+# ── Plage des données + défaut YTD ───────────────────────────────────────────
 today     = pd.Timestamp.today().normalize()
 data_min  = df_all["date_cloture"].min().date()
 data_max  = df_all["date_cloture"].max().date()
-
-if not df_tr.empty:
-    data_min = min(data_min, df_tr["date_travail"].min().date())
-    data_max = max(data_max, df_tr["date_travail"].max().date())
-
 ytd_start = max(pd.Timestamp(today.year, 1, 1).date(), data_min)
 ytd_end   = min(today.date(), data_max)
 
@@ -205,10 +111,6 @@ def _init(key, val):
 
 _init("date_debut",      ytd_start)
 _init("date_fin",        ytd_end)
-_init("sel_statut",      "Tous")
-_init("sel_poste",       "Tous")
-_init("sel_op",          "Tous")
-_init("sel_operateur",   "Tous")
 _init("_dossier_filtre", "Tous")
 _init("_devis_filtre",   "Tous")
 _init("_last_tbl_sel",   False)
@@ -219,7 +121,6 @@ def reset_filters():
     st.session_state["sel_statut"]       = "Tous"
     st.session_state["sel_poste"]        = "Tous"
     st.session_state["sel_op"]           = "Tous"
-    st.session_state["sel_operateur"]    = "Tous"
     st.session_state["_dossier_filtre"]  = "Tous"
     st.session_state["_devis_filtre"]    = "Tous"
     st.session_state["maille"]           = "Mois"
@@ -227,7 +128,7 @@ def reset_filters():
 
 # ── Ligne filtres ─────────────────────────────────────────────────────────────
 row1 = st.columns([1.1, 1.1, 1, 1, 1, 0.8])
-row2 = st.columns([1.1, 1.1, 1.1, 2.9])          
+row2 = st.columns([1, 1, 1, 3.2])          
 
 date_debut = row1[0].date_input("📅 Date début", min_value=data_min, max_value=data_max, key="date_debut")
 date_fin   = row1[1].date_input("📅 Date fin", min_value=data_min, max_value=data_max, key="date_fin")
@@ -244,7 +145,6 @@ sel_op     = row1[4].selectbox("Opération", operations, key="sel_op")
 row1[5].markdown("<br>", unsafe_allow_html=True)
 row1[5].button("🔄 Réinitialiser", on_click=reset_filters, use_container_width=True)
 
-# Filtres dossier et devis
 dossiers = ["Tous"] + sorted([d for d in df_all["numero_dossier"].unique() if d])
 try:
     idx_dossier = dossiers.index(st.session_state["_dossier_filtre"])
@@ -266,20 +166,7 @@ def on_devis_change():
     st.session_state["_devis_filtre"] = st.session_state["widget_devis"]
 
 row2[1].selectbox("N° de devis", devis_list, index=idx_devis, key="widget_devis", on_change=on_devis_change)
-
-# Nouveau Filtre par Opérateur (depuis les feuilles TR ou OF)
-if not df_tr.empty:
-    operateurs = ["Tous"] + sorted(df_tr["nom_operateur"].dropna().unique().tolist())
-else:
-    operateurs = ["Tous"]
-    
-try:
-    idx_op = operateurs.index(st.session_state["sel_operateur"])
-except ValueError:
-    idx_op = 0
-
-sel_operateur = row2[2].selectbox("Opérateur", operateurs, index=idx_op, key="sel_operateur")
-row2[3].empty()
+row2[2].empty()
 
 # ── Appliquer tous les filtres ────────────────────────────────────────────────
 dossier_actif = st.session_state["_dossier_filtre"]
@@ -293,12 +180,7 @@ if sel_op        != "Tous": df = df[df["operation"]         == sel_op]
 if dossier_actif != "Tous": df = df[df["numero_dossier"]    == dossier_actif]
 if devis_actif   != "Tous": df = df[df["numero_devis"]      == devis_actif]
 
-# Filtrer aussi la table de production classique par opérateur s'il est mappé
-if sel_operateur != "Tous" and "nom_operateur" in df.columns:
-    if not (df["nom_operateur"] == "Inconnu").all():
-        df = df[df["nom_operateur"] == sel_operateur]
-
-# ── KPIs Globaux ──────────────────────────────────────────────────────────────
+# ── KPIs ──────────────────────────────────────────────────────────────────────
 total_op    = df["tps_op_h"].sum()
 total_devis = df["tps_devis_h"].sum()
 efficacite  = total_op / total_devis if total_devis > 0 else 0
@@ -418,83 +300,6 @@ with col_op_tbl:
     st.markdown("**Détail par opération**")
     st.dataframe(by_op_tbl, use_container_width=True, height=390, hide_index=True)
 
-# ── NOUVELLE SECTION : TEMPS RÉEL OPÉRATEURS ──────────────────────────────────
-if not df_tr.empty:
-    st.markdown("---")
-    st.markdown("### 🕒 Suivi du Temps Réel des Opérateurs")
-
-    # Filtrer df_tr selon les dates globales et l'opérateur sélectionné
-    df_tr_filtered = df_tr[(df_tr["date_travail"].dt.date >= date_debut) & (df_tr["date_travail"].dt.date <= date_fin)]
-    if sel_operateur != "Tous":
-        df_tr_filtered = df_tr_filtered[df_tr_filtered["nom_operateur"] == sel_operateur]
-
-    # KPIs Temps Réel
-    tr_k1, tr_k2, tr_k3 = st.columns(3)
-    total_hours_tr = df_tr_filtered["heures_travaillees"].sum()
-    active_ops_count = df_tr_filtered["nom_operateur"].nunique()
-    avg_hours_tr = total_hours_tr / active_ops_count if active_ops_count > 0 else 0
-
-    tr_k1.markdown(f'<div class="kpi-card"><div class="kpi-label">⏳ Total heures réelles travaillées</div><div class="kpi-value">{total_hours_tr:,.2f} h</div></div>', unsafe_allow_html=True)
-    tr_k2.markdown(f'<div class="kpi-card"><div class="kpi-label">👥 Opérateurs Actifs</div><div class="kpi-value">{active_ops_count}</div></div>', unsafe_allow_html=True)
-    tr_k3.markdown(f'<div class="kpi-card"><div class="kpi-label">📊 Moyenne d\'Heures / Opérateur</div><div class="kpi-value">{avg_hours_tr:,.2f} h</div></div>', unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # Sélecteur de maille temporelle spécifique au temps réel (Jour / Semaine / Heure)
-    col_tr_radio, col_tr_empty = st.columns([1.5, 2.5])
-    maille_tr = col_tr_radio.radio(
-        "Maille temporelle (Suivi Opérateur)", 
-        ["Jour", "Semaine", "Heure"], 
-        index=0, 
-        horizontal=True, 
-        key="maille_tr"
-    )
-    
-    maille_tr_col = {
-        "Jour": "jour_label",
-        "Semaine": "semaine_label",
-        "Heure": "heure_label"
-    }[maille_tr]
-
-    # Agrégation des données
-    by_maille_tr = df_tr_filtered.groupby([maille_tr_col, "nom_operateur"])["heures_travaillees"].sum().reset_index()
-    by_maille_tr = by_maille_tr.sort_values(maille_tr_col)
-
-    # Génération du graphique Plotly (Barres empilées pour voir le total cumulé et la part de chacun)
-    fig_tr = go.Figure()
-    for op in by_maille_tr["nom_operateur"].unique():
-        op_sub = by_maille_tr[by_maille_tr["nom_operateur"] == op]
-        fig_tr.add_trace(go.Bar(
-            x=op_sub[maille_tr_col],
-            y=op_sub["heures_travaillees"],
-            name=op
-        ))
-
-    fig_tr.update_layout(
-        title=f"Heures travaillées par {maille_tr.lower()} et opérateur",
-        barmode="stack",
-        xaxis_title=maille_tr,
-        yaxis_title="Heures",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        plot_bgcolor="white", paper_bgcolor="white",
-        margin=dict(t=50, b=40, l=40, r=20), height=380,
-    )
-
-    # Tableau de synthèse des opérateurs
-    by_op_tbl = df_tr_filtered.groupby("nom_operateur")["heures_travaillees"].sum().reset_index()
-    by_op_tbl = by_op_tbl.sort_values("heures_travaillees", ascending=False).reset_index(drop=True)
-    by_op_tbl.columns = ["Opérateur", "Total heures (h)"]
-    by_op_tbl["Total heures (h)"] = by_op_tbl["Total heures (h)"].round(2)
-
-    col_tr_chart, col_tr_tbl = st.columns([1.3, 1])
-    col_tr_chart.plotly_chart(fig_tr, use_container_width=True)
-    with col_tr_tbl:
-        st.markdown("**Synthèse des heures réelles par opérateur**")
-        st.dataframe(by_op_tbl, use_container_width=True, height=330, hide_index=True)
-else:
-    st.markdown("---")
-    st.warning("⚠️ Onglet 'Temps Réel Opérateur' absent ou illisible dans le fichier source.")
-
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.caption(f"📁 Source : `{src_label}` · {len(df_all):,} lignes OF · {len(df_tr) if not df_tr.empty else 0:,} lignes Temps Réel · Période : {date_debut} → {date_fin}")
+st.caption(f"📁 Source : `{src_label}` · {len(df_all):,} lignes totales · {len(df):,} lignes filtrées · Période : {date_debut} → {date_fin}")
